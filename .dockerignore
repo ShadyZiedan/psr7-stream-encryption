@@ -1,0 +1,47 @@
+# Git
+.git
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Composer
+# /vendor/ - исключаем, чтобы зависимости устанавливались в контейнере
+# composer.lock - исключаем, чтобы зависимости устанавливались в контейнере
+
+# PHPUnit
+.phpunit.cache/
+coverage/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+*.encrypted
+*.decrypted
+*.sidecar
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Documentation
+README.md
+LICENSE
+
+

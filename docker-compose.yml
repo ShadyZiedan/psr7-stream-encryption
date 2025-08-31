@@ -1,0 +1,47 @@
+services:
+  app:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./samples:/app/samples
+      - ./tests:/app/tests
+      - ./composer.json:/app/composer.json
+      - ./phpunit.xml:/app/phpunit.xml
+    environment:
+      - PHP_MEMORY_LIMIT=512M
+    working_dir: /app
+    command: php samples/example.php
+
+  test:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./samples:/app/samples
+      - ./tests:/app/tests
+      - ./composer.json:/app/composer.json
+      - ./phpunit.xml:/app/phpunit.xml
+    environment:
+      - PHP_MEMORY_LIMIT=512M
+    working_dir: /app
+    command: composer test
+
+  shell:
+    build: .
+    volumes:
+      - ./src:/app/src
+      - ./samples:/app/samples
+      - ./tests:/app/tests
+      - ./composer.json:/app/composer.json
+      - ./phpunit.xml:/app/phpunit.xml
+    environment:
+      - PHP_MEMORY_LIMIT=512M
+    stdin_open: true
+    tty: true
+    command: /bin/bash
+
+  requirements:
+    build: .
+    volumes:
+      - ./src:/app/src
+    working_dir: /app
+    command: php src/requirements.php
