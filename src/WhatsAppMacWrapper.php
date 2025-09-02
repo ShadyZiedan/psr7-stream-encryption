@@ -4,120 +4,114 @@ declare(strict_types=1);
 
 namespace WhatsApp\Psr7StreamEncryption;
 
+use GuzzleHttp\Psr7\AppendStream;
+use GuzzleHttp\Psr7\Utils;
+use Jsq\EncryptionStreams\HashingStream;
 use Psr\Http\Message\StreamInterface;
 use RuntimeException;
 
+// MAC WRAPPER - for adding MAC to encrypted data
 class WhatsAppMacWrapper implements StreamInterface
 {
     private const MAC_SIZE = 10;
-    
-    private StreamInterface $encryptedStream;
+
+    private StreamInterface $baseStream;
     private string $iv;
     private string $macKey;
-    private ?string $dataWithMac = null;
-    private ?int $size = null;
-    private int $position = 0;
+    private ?StreamInterface $finalStream = null;
 
     public function __construct(StreamInterface $encryptedStream, string $iv, string $macKey)
     {
-        $this->encryptedStream = $encryptedStream;
+        $this->baseStream = $encryptedStream;
         $this->iv = $iv;
         $this->macKey = $macKey;
     }
 
-    private function addMac(): void
+    private function buildFinalStream(): StreamInterface
     {
-        if ($this->dataWithMac !== null) {
-            return;
+        if ($this->finalStream !== null) {
+            return $this->finalStream;
         }
 
-        $encryptedData = $this->encryptedStream->getContents();
-        $this->encryptedStream->rewind();
+        $this->baseStream->rewind();
 
-        $dataToSign = $this->iv . $encryptedData;
-        $mac = hash_hmac('sha256', $dataToSign, $this->macKey, true);
-        $macTruncated = substr($mac, 0, self::MAC_SIZE);
+        $ivStream = Utils::streamFor($this->iv);
+        $macCalculationStream = new AppendStream([$ivStream, $this->baseStream]);
 
-        $this->dataWithMac = $encryptedData . $macTruncated;
-        $this->size = strlen($this->dataWithMac);
-        $this->position = 0;
+        $mac = '';
+        $hashingStream = new HashingStream(
+            $macCalculationStream,
+            $this->macKey,
+            static function(string $hash) use (&$mac): void {
+                $mac = substr($hash, 0, self::MAC_SIZE);
+            },
+            'sha256'
+        );
+
+        $hashingStream->getContents();
+
+        $this->baseStream->rewind();
+        $this->finalStream = new AppendStream([
+            $this->baseStream,
+            Utils::streamFor($mac)
+        ]);
+
+        return $this->finalStream;
     }
 
     public function __toString(): string
     {
-        $this->addMac();
-        return $this->dataWithMac;
+        try {
+            return $this->buildFinalStream()->__toString();
+        } catch (\Throwable $e) {
+            return '';
+        }
     }
 
     public function close(): void
     {
-        $this->dataWithMac = null;
-        $this->position = 0;
-        $this->size = null;
-        $this->encryptedStream->close();
+        $this->finalStream?->close();
+        $this->baseStream->close();
+        $this->finalStream = null;
     }
 
     public function detach()
     {
-        $this->dataWithMac = null;
-        $this->position = 0;
-        $this->size = null;
-        return $this->encryptedStream->detach();
+        $result = $this->finalStream?->detach();
+        $this->baseStream->detach();
+        $this->finalStream = null;
+        return $result;
     }
 
     public function getSize(): ?int
     {
-        $this->addMac();
-        return $this->size;
+        $baseSize = $this->baseStream->getSize();
+        return $baseSize !== null ? $baseSize + self::MAC_SIZE : null;
     }
 
     public function tell(): int
     {
-        $this->addMac();
-        return $this->position;
+        return $this->buildFinalStream()->tell();
     }
 
     public function eof(): bool
     {
-        $this->addMac();
-        return $this->position >= $this->size;
+        return $this->buildFinalStream()->eof();
     }
 
     public function isSeekable(): bool
     {
-        return true;
+        return $this->buildFinalStream()->isSeekable();
     }
 
     public function seek(int $offset, int $whence = SEEK_SET): void
     {
-        $this->addMac();
-        
-        switch ($whence) {
-            case SEEK_SET:
-                $this->position = $offset;
-                break;
-            case SEEK_CUR:
-                $this->position += $offset;
-                break;
-            case SEEK_END:
-                $this->position = $this->size + $offset;
-                break;
-            default:
-                throw new RuntimeException('Invalid whence value');
-        }
-        
-        if ($this->position < 0) {
-            throw new RuntimeException('Cannot seek to negative position');
-        }
-        
-        if ($this->position > $this->size) {
-            throw new RuntimeException('Cannot seek beyond end of stream');
-        }
+        $this->buildFinalStream()->seek($offset, $whence);
     }
 
     public function rewind(): void
     {
-        $this->position = 0;
+        $this->buildFinalStream()->rewind();
     }
 
     public function isWritable(): bool
@@ -137,37 +131,16 @@ class WhatsAppMacWrapper implements StreamInterface
 
     public function read(int $length): string
     {
-        $this->addMac();
-        
-        if ($this->position >= $this->size) {
-            return '';
-        }
-        
-        $remaining = $this->size - $this->position;
-        $readLength = min($length, $remaining);
-        
-        $data = substr($this->dataWithMac, $this->position, $readLength);
-        $this->position += $readLength;
-        
-        return $data;
+        return $this->buildFinalStream()->read($length);
     }
 
     public function getContents(): string
     {
-        $this->addMac();
-        
-        if ($this->position >= $this->size) {
-            return '';
-        }
-        
-        $data = substr($this->dataWithMac, $this->position);
-        $this->position = $this->size;
-        
-        return $data;
+        return $this->buildFinalStream()->getContents();
     }
 
     public function getMetadata(?string $key = null)
     {
-        return $this->encryptedStream->getMetadata($key);
+        return $this->buildFinalStream()->getMetadata($key);
     }
 }

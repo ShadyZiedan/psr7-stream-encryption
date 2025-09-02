@@ -4,131 +4,134 @@ declare(strict_types=1);
 
 namespace WhatsApp\Psr7StreamEncryption;
 
+use GuzzleHttp\Psr7\AppendStream;
+use GuzzleHttp\Psr7\LimitStream;
+use GuzzleHttp\Psr7\Utils;
+use Jsq\EncryptionStreams\HashingStream;
 use Psr\Http\Message\StreamInterface;
 use RuntimeException;
 
 class WhatsAppMacValidator implements StreamInterface
 {
     private const MAC_SIZE = 10;
-    
-    private StreamInterface $encryptedStream;
+
+    private StreamInterface $sourceStream;
     private string $iv;
     private string $macKey;
-    private ?string $encryptedData = null;
-    private ?int $size = null;
-    private int $position = 0;
+    private ?StreamInterface $validatedStream = null;
 
     public function __construct(StreamInterface $encryptedStream, string $iv, string $macKey)
     {
-        $this->encryptedStream = $encryptedStream;
+        $this->sourceStream = $encryptedStream;
         $this->iv = $iv;
         $this->macKey = $macKey;
     }
 
-    private function validateMac(): void
+    private function getValidatedStream(): StreamInterface
     {
-        if ($this->encryptedData !== null) {
-            return;
+        if ($this->validatedStream !== null) {
+            return $this->validatedStream;
         }
 
-        $allData = $this->encryptedStream->getContents();
-        $this->encryptedStream->rewind();
+        $totalSize = $this->sourceStream->getSize();
+        if ($totalSize === null) {
+            throw new RuntimeException('Cannot determine stream size');
+        }
 
-        if (strlen($allData) < self::MAC_SIZE) {
+        if ($totalSize < self::MAC_SIZE) {
             throw new RuntimeException('Encrypted data too short');
         }
 
-        $encryptedFile = substr($allData, 0, -self::MAC_SIZE);
-        $mac = substr($allData, -self::MAC_SIZE);
+        $encryptedSize = $totalSize - self::MAC_SIZE;
+        $this->sourceStream->rewind();
 
-        $dataToVerify = $this->iv . $encryptedFile;
-        $expectedMac = hash_hmac('sha256', $dataToVerify, $this->macKey, true);
-        $expectedMacTruncated = substr($expectedMac, 0, self::MAC_SIZE);
+        $encryptedDataStream = new LimitStream($this->sourceStream, $encryptedSize);
 
-        if (!hash_equals($mac, $expectedMacTruncated)) {
+        $ivStream = Utils::streamFor($this->iv);
+        $validationStream = new AppendStream([$ivStream, $encryptedDataStream]);
+
+        $expectedMac = '';
+        $hashingStream = new HashingStream(
+            $validationStream,
+            $this->macKey,
+            static function(string $hash) use (&$expectedMac): void {
+                $expectedMac = substr($hash, 0, self::MAC_SIZE);
+            },
+            'sha256'
+        );
+
+        $hashingStream->getContents();
+
+        $this->sourceStream->rewind();
+        $macStream = new LimitStream($this->sourceStream, self::MAC_SIZE, $encryptedSize);
+        $actualMac = $macStream->getContents();
+
+        if (strlen($actualMac) !== self::MAC_SIZE) {
+            throw new RuntimeException('Failed to read MAC');
+        }
+
+        if (!hash_equals($actualMac, $expectedMac)) {
             throw new RuntimeException('MAC verification failed');
         }
 
-        $this->encryptedData = $encryptedFile;
-        $this->size = strlen($this->encryptedData);
-        $this->position = 0;
+        $this->sourceStream->rewind();
+        $this->validatedStream = new LimitStream($this->sourceStream, $encryptedSize);
+
+        return $this->validatedStream;
     }
 
     public function __toString(): string
     {
-        $this->validateMac();
-        return $this->encryptedData;
+        try {
+            return $this->getValidatedStream()->__toString();
+        } catch (\Throwable $e) {
+            return '';
+        }
     }
 
     public function close(): void
     {
-        $this->encryptedData = null;
-        $this->position = 0;
-        $this->size = null;
-        $this->encryptedStream->close();
+        $this->validatedStream?->close();
+        $this->sourceStream->close();
+        $this->validatedStream = null;
     }
 
     public function detach()
     {
-        $this->encryptedData = null;
-        $this->position = 0;
-        $this->size = null;
-        return $this->encryptedStream->detach();
+        $result = $this->validatedStream?->detach();
+        $this->sourceStream->detach();
+        $this->validatedStream = null;
+        return $result;
     }
 
     public function getSize(): ?int
     {
-        $this->validateMac();
-        return $this->size;
+        return $this->getValidatedStream()->getSize();
     }
 
     public function tell(): int
     {
-        $this->validateMac();
-        return $this->position;
+        return $this->getValidatedStream()->tell();
     }
 
     public function eof(): bool
     {
-        $this->validateMac();
-        return $this->position >= $this->size;
+        return $this->getValidatedStream()->eof();
     }
 
     public function isSeekable(): bool
     {
-        return true;
+        return $this->getValidatedStream()->isSeekable();
     }
 
     public function seek(int $offset, int $whence = SEEK_SET): void
     {
-        $this->validateMac();
-        
-        switch ($whence) {
-            case SEEK_SET:
-                $this->position = $offset;
-                break;
-            case SEEK_CUR:
-                $this->position += $offset;
-                break;
-            case SEEK_END:
-                $this->position = $this->size + $offset;
-                break;
-            default:
-                throw new RuntimeException('Invalid whence value');
-        }
-        
-        if ($this->position < 0) {
-            throw new RuntimeException('Cannot seek to negative position');
-        }
-        
-        if ($this->position > $this->size) {
-            throw new RuntimeException('Cannot seek beyond end of stream');
-        }
+        $this->getValidatedStream()->seek($offset, $whence);
     }
 
     public function rewind(): void
     {
-        $this->position = 0;
+        $this->getValidatedStream()->rewind();
     }
 
     public function isWritable(): bool
@@ -148,37 +151,16 @@ class WhatsAppMacValidator implements StreamInterface
 
     public function read(int $length): string
     {
-        $this->validateMac();
-        
-        if ($this->position >= $this->size) {
-            return '';
-        }
-        
-        $remaining = $this->size - $this->position;
-        $readLength = min($length, $remaining);
-        
-        $data = substr($this->encryptedData, $this->position, $readLength);
-        $this->position += $readLength;
-        
-        return $data;
+        return $this->getValidatedStream()->read($length);
     }
 
     public function getContents(): string
     {
-        $this->validateMac();
-        
-        if ($this->position >= $this->size) {
-            return '';
-        }
-        
-        $data = substr($this->encryptedData, $this->position);
-        $this->position = $this->size;
-        
-        return $data;
+        return $this->getValidatedStream()->getContents();
     }
 
     public function getMetadata(?string $key = null)
     {
-        return $this->encryptedStream->getMetadata($key);
+        return $this->getValidatedStream()->getMetadata($key);
     }
 }
